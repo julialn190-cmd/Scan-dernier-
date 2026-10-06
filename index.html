@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>PointScan V3.2</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;height:100%;overflow:hidden;background:#000;color:#fff;font-family:system-ui}
+video,#gl{position:fixed;inset:0;width:100%;height:100%;object-fit:cover}#gl{z-index:2;pointer-events:none}
+#work{display:none}#ui{position:fixed;z-index:9;left:8px;right:8px;bottom:8px;background:#090909e8;border:1px solid #555;border-radius:14px;padding:10px}
+.row{display:flex;gap:6px;margin-top:7px}button{flex:1;padding:12px 5px;border:1px solid #555;border-radius:10px;background:#181818;color:#fff;font-weight:700}
+#log{margin-top:8px;max-height:120px;overflow:auto;background:#000;border:1px solid #333;border-radius:8px;padding:7px;font:11px/1.35 monospace;white-space:pre-wrap}
+#state{font-size:12px;margin-top:6px}.ok{color:#9f9}.err{color:#f99}
+</style>
+</head>
+<body>
+<video id="video" playsinline muted></video><canvas id="gl"></canvas><canvas id="work"></canvas>
+<div id="ui"><b>PointScan V3.2 — caméra corrigée</b>
+<div id="state">Prêt.</div>
+<div class="row"><button id="camera">1 CAMÉRA</button><button id="ai">2 IA</button><button id="capture">3 CAPTURER</button></div>
+<div class="row"><button id="view">IMMERSION</button><button id="clear">EFFACER</button><button id="ply">EXPORT PLY</button></div>
+<div id="log">Diagnostic démarré.</div></div>
+
+<script type="module">
+const logEl=document.querySelector('#log'),state=document.querySelector('#state');
+function log(s,err=false){const t=new Date().toLocaleTimeString();logEl.textContent+=`\n${t} ${s}`;logEl.scrollTop=logEl.scrollHeight;state.textContent=s;state.className=err?'err':'ok'}
+window.addEventListener('error',e=>log('ERREUR JS: '+(e.message||e.error),true));
+window.addEventListener('unhandledrejection',e=>log('PROMESSE: '+(e.reason?.message||e.reason),true));
+
+let THREE,pipeline,env;
+try{
+ log('Chargement Three.js…');
+ THREE=await import('https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js');
+ log('Three.js OK');
+ log('Chargement Transformers.js…');
+ ({pipeline,env}=await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1'));
+ env.allowLocalModels=false; log('Transformers.js OK');
+}catch(e){log('IMPORT: '+e.message,true)}
+
+const video=document.querySelector('#video'),work=document.querySelector('#work'),ctx=work.getContext('2d',{willReadFrequently:true});
+let depth=null,busy=false,pos=[],col=[],immersive=false;
+
+const renderer=new THREE.WebGLRenderer({canvas:document.querySelector('#gl'),alpha:true,antialias:false});
+renderer.setPixelRatio(Math.min(devicePixelRatio,1.2));renderer.setClearColor(0,0);
+const scene=new THREE.Scene(),cam=new THREE.PerspectiveCamera(67,innerWidth/innerHeight,.01,100);cam.position.z=.3;
+const geo=new THREE.BufferGeometry(),mat=new THREE.PointsMaterial({size:.014,vertexColors:true});
+const cloud=new THREE.Points(geo,mat);scene.add(cloud);
+function resize(){renderer.setSize(innerWidth,innerHeight,false);cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix()}resize();addEventListener('resize',resize);
+(function loop(){renderer.render(scene,cam);requestAnimationFrame(loop)})();
+
+async function startCamera(){
+ try{
+  log('Vérification caméra…');
+  if(!window.isSecureContext) throw new Error('Ouvre PointScan depuis GitHub Pages en HTTPS.');
+  if(!navigator.mediaDevices?.getUserMedia) throw new Error('Accès caméra indisponible dans cette page.');
+  if(video.srcObject){video.srcObject.getTracks().forEach(t=>t.stop());video.srcObject=null}
+  let perm='unknown';
+  try{if(navigator.permissions?.query){perm=(await navigator.permissions.query({name:'camera'})).state;log('Permission caméra : '+perm)}}catch(_){}
+  if(perm==='denied') throw new Error("Caméra bloquée par Chrome. Autorise la caméra pour ce site puis recharge.");
+  log('Demande caméra…');
+  let stream;
+  try{stream=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{exact:'environment'}}})}
+  catch(e){
+   if(e.name==='OverconstrainedError'||e.name==='NotFoundError'){
+    log('Nouvel essai caméra…');
+    stream=await navigator.mediaDevices.getUserMedia({audio:false,video:true});
+   } else throw e;
+  }
+  video.srcObject=stream;video.muted=true;video.setAttribute('playsinline','');await video.play();
+  log(`CAMÉRA OK ${video.videoWidth}x${video.videoHeight}`);
+ }catch(e){
+  let m=(e?.name?e.name+': ':'')+(e?.message||e);
+  if(e?.name==='NotAllowedError')m+=" — Dans Chrome, autorise la caméra pour PointScan puis recharge.";
+  log('CAMÉRA ÉCHEC: '+m,true);
+ }
+}
+async function loadAI(){
+ if(depth||busy)return;busy=true;
+ try{
+  log('Téléchargement IA. Ne ferme pas Chrome…');
+  depth=await pipeline('depth-estimation','Xenova/dpt-hybrid-midas');
+  log('IA OK');
+ }catch(e){log('IA ÉCHEC: '+e.message,true)}finally{busy=false}
+}
+async function capture(){
+ log('Bouton CAPTURER reçu');
+ if(busy){log('Occupé, attends.',true);return}
+ if(!video.srcObject||video.readyState<2){log('Caméra pas prête.',true);return}
+ if(!depth){log('IA pas chargée. Appuie sur 2 IA.',true);return}
+ busy=true;
+ try{
+  log('Étape A: copie image caméra');
+  const W=256,H=Math.max(144,Math.round(W*video.videoHeight/video.videoWidth));
+  work.width=W;work.height=H;ctx.drawImage(video,0,0,W,H);
+  const pixels=ctx.getImageData(0,0,W,H);log(`Étape A OK ${W}x${H}`);
+  log('Étape B: JPEG');
+  const blob=await new Promise((res,rej)=>work.toBlob(b=>b?res(b):rej(Error('toBlob vide')),'image/jpeg',.82));
+  const url=URL.createObjectURL(blob);log(`Étape B OK ${Math.round(blob.size/1024)} Ko`);
+  log('Étape C: profondeur IA…');
+  let result;
+  try{result=await depth(url)}finally{URL.revokeObjectURL(url)}
+  log('Étape C OK');
+  const ten=result.predicted_depth||result.depth;
+  if(!ten||!ten.data)throw Error('La sortie IA ne contient pas de profondeur exploitable');
+  const d=ten.data,dims=ten.dims||[ten.height,ten.width],dh=dims[dims.length-2],dw=dims[dims.length-1];
+  log(`Étape D: profondeur ${dw}x${dh}`);
+  let min=Infinity,max=-Infinity;
+  for(let i=0;i<d.length;i++){let v=d[i];if(Number.isFinite(v)){if(v<min)min=v;if(v>max)max=v}}
+  if(!Number.isFinite(min)||max<=min)throw Error('Valeurs profondeur invalides');
+  const f=.5*W/Math.tan(67*Math.PI/360),stride=3;
+  for(let y=0;y<H;y+=stride)for(let x=0;x<W;x+=stride){
+   const di=Math.min(d.length-1,Math.round(y/H*(dh-1))*dw+Math.round(x/W*(dw-1)));
+   let n=(d[di]-min)/(max-min);n=Math.max(0,Math.min(1,n));
+   let z=.35+(1-n)*2.8,k=(y*W+x)*4;
+   pos.push((x-W/2)*z/f,-(y-H/2)*z/f,-z);
+   col.push(pixels.data[k]/255,pixels.data[k+1]/255,pixels.data[k+2]/255);
+  }
+  const limit=180000;if(pos.length/3>limit){const cut=Math.floor(pos.length/3-limit)*3;pos.splice(0,cut);col.splice(0,cut)}
+  geo.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));geo.setAttribute('color',new THREE.Float32BufferAttribute(col,3));geo.computeBoundingSphere();
+  log(`SUCCÈS: ${Math.floor(pos.length/3)} points`);
+ }catch(e){log('CAPTURE ÉCHEC: '+e.message,true)}finally{busy=false}
+}
+document.querySelector('#camera').onclick=startCamera;
+document.querySelector('#ai').onclick=loadAI;
+document.querySelector('#capture').onclick=capture;
+document.querySelector('#view').onclick=()=>{immersive=!immersive;video.style.display=immersive?'none':'block';renderer.setClearColor(0,immersive?1:0);log(immersive?'Immersion ON':'Immersion OFF')};
+document.querySelector('#clear').onclick=()=>{pos=[];col=[];geo.deleteAttribute('position');geo.deleteAttribute('color');log('Nuage effacé')};
+document.querySelector('#ply').onclick=()=>{
+ try{
+  let n=pos.length/3,s=`ply\nformat ascii 1.0\nelement vertex ${n}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n`;
+  let a=[s];for(let i=0;i<n;i++)a.push(`${pos[i*3]} ${pos[i*3+1]} ${pos[i*3+2]} ${Math.round(col[i*3]*255)} ${Math.round(col[i*3+1]*255)} ${Math.round(col[i*3+2]*255)}\n`);
+  let u=URL.createObjectURL(new Blob(a)),l=document.createElement('a');l.href=u;l.download='pointscan.ply';l.click();setTimeout(()=>URL.revokeObjectURL(u),1000);log('PLY exporté');
+ }catch(e){log('EXPORT ÉCHEC: '+e.message,true)}
+};
+</script></body></html>
